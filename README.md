@@ -7,8 +7,7 @@ src/
 |- makefile   # Файл компиляции
 |- service.sh # Скрипт установки сервиса
 |- asynserver.service # Конфигурация SystemD
-doc/
-|- README.md  # Документация по проекту
+README.md  # Документация по проекту
 build/
 |- debian     # Директория для подготовки .deb-пакета
 ```
