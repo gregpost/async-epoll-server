@@ -1,0 +1,307 @@
+## Задача
+
+Реализовать серверное приложение на C/C++, работающее под Linux, которое асинхронно обрабатывает запросы по TCP и UDP с использованием механизма `epoll`. Сервер поддерживает три команды (`/time`, `/stats` и `/shutdown`), а также отправляет обратно отражённые сообщения клиентам.
+
+### Основные требования:
+- Асинхронная обработка соединений через механизм `epoll`.
+- Поддержка протоколов TCP и UDP.
+- Реализация обработки команд:
+  * `/time`: возвращает текущее время и дату.
+  * `/stats`: выводит статистику по количеству подключённых пользователей.
+  * `/shutdown`: завершает работу сервера.
+- Отправка всех остальных сообщений клиенту без изменений ("зеркалирование").
+- Использование стандартных библиотек Linux.
+- Предоставление файлов сборки через `Makefile`, файла конфигурации для запуска службы через систему инициализации `systemd` и простейшего пакета DEB или RPM.
+
+---
+
+## Реализация
+
+Проект состоит из двух основных частей:
+
+1. **Серверное приложение** (сервер слушает соединения по TCP и принимает пакеты по UDP).
+2. **Файлы для настройки системы**: `Makefile`, конфигурационный файл `systemd`, сборочный пакет `.deb` или `.rpm`.
+
+Для реализации выберем следующую структуру проекта:
+```
+src/
+|- server.c   # Основной код сервера
+|- makefile   # Файл компиляции
+|- service.sh # Скрипт установки сервиса
+|- asynserver.service # Конфигурация SystemD
+doc/
+|- README.md  # Документация по проекту
+build/
+|- debian     # Директория для подготовки .deb-пакета
+|
+
+# Подготовка структуры директорий
+mkdir src doc build && cd src
+touch server.c makefile service.sh
+cd ../build
+mkdir debian
+```
+
+### 1. Исходный код сервера (`server.c`)
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/epoll.h>
+#include <time.h>
+
+#define MAX_EVENTS 10
+#define BUFFER_SIZE 1024
+
+// Структура хранения статистики
+typedef struct {
+    int total_clients;
+    int current_clients;
+} Stats;
+
+Stats stats = {0};
+
+void set_non_blocking(int sockfd) {
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags == -1)
+        perror("fcntl");
+    else if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) == -1)
+        perror("fcntl non-blocking");
+}
+
+char* handle_command(const char* cmd) {
+    static char response[BUFFER_SIZE];
+    time_t now = time(NULL);
+    struct tm *tm_now = localtime(&now);
+    
+    // Обработка команд
+    if (!strcmp(cmd, "/time")) {
+        strftime(response, sizeof(response), "%Y-%m-%d %H:%M:%S\n", tm_now);
+    }
+    else if (!strcmp(cmd, "/stats")) {
+        snprintf(response, sizeof(response),
+                 "Total clients: %d\nCurrent connected: %d\n",
+                 stats.total_clients,
+                 stats.current_clients);
+    }
+    else if (!strcmp(cmd, "/shutdown")) {
+        strcpy(response, "Shutting down...\n");
+    }
+    return response;
+}
+
+int main() {
+    int tcp_sockfd, udp_sockfd, epollfd, nfds, connfd;
+    struct sockaddr_in serv_addr, cli_addr;
+    struct epoll_event event, events[MAX_EVENTS];
+    char buffer[BUFFER_SIZE], ipaddr[INET_ADDRSTRLEN];
+    socklen_t addrlen;
+    ssize_t nbytes;
+
+    // Создаем сокеты
+    tcp_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    udp_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    memset(&serv_addr, '0', sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(8080);
+    serv_addr.sin_addr.s_addr = INADDR_ANY;
+
+    bind(tcp_sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+    listen(tcp_sockfd, 3);
+
+    bind(udp_sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+
+    // Настройка неблокирующего режима
+    set_non_blocking(tcp_sockfd);
+    set_non_blocking(udp_sockfd);
+
+    // Создание epoll'а
+    epollfd = epoll_create1(0);
+    if (epollfd == -1) {
+        perror("epoll_create1");
+        exit(EXIT_FAILURE);
+    }
+
+    // Регистрация TCP и UDP сокетов
+    event.events = EPOLLIN | EPOLLET;
+    event.data.fd = tcp_sockfd;
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, tcp_sockfd, &event);
+
+    event.data.fd = udp_sockfd;
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, udp_sockfd, &event);
+
+    while (1) {
+        nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
+        for (int i = 0; i < nfds; ++i) {
+            if (events[i].data.fd == tcp_sockfd) {
+                // Принять новое соединение
+                connfd = accept(tcp_sockfd, NULL, NULL);
+                if (connfd != -1) {
+                    set_non_blocking(connfd);
+                    event.events = EPOLLIN | EPOLLET;
+                    event.data.fd = connfd;
+                    epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &event);
+                    printf("TCP client connected.\n");
+                    stats.total_clients++;
+                    stats.current_clients++;
+                }
+            }
+            else if (events[i].data.fd == udp_sockfd) {
+                // Получение пакетов по UDP
+                addrlen = sizeof(cli_addr);
+                nbytes = recvfrom(events[i].data.fd, buffer, BUFFER_SIZE, 0,
+                                  (struct sockaddr*)&cli_addr, &addrlen);
+                inet_ntop(AF_INET, &(cli_addr.sin_addr), ipaddr, INET_ADDRSTRLEN);
+                printf("UDP packet from %s:%d (%ld bytes)\n", ipaddr, ntohs(cli_addr.sin_port), nbytes);
+                
+                if (buffer[0] == '/') {
+                    const char* resp = handle_command(buffer + 1);
+                    sendto(events[i].data.fd, resp, strlen(resp), 0,
+                           (struct sockaddr*)&cli_addr, addrlen);
+                } else {
+                    sendto(events[i].data.fd, buffer, nbytes, 0,
+                          (struct sockaddr*)&cli_addr, addrlen);
+                }
+            }
+            else {
+                // Чтение данных от клиента TCP
+                nbytes = read(events[i].data.fd, buffer, BUFFER_SIZE);
+                if (nbytes <= 0) {
+                    close(events[i].data.fd);
+                    stats.current_clients--;
+                    continue;
+                }
+
+                if (buffer[0] == '/') {
+                    const char* resp = handle_command(buffer + 1);
+                    write(events[i].data.fd, resp, strlen(resp));
+                } else {
+                    write(events[i].data.fd, buffer, nbytes);
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+```
+
+### 2. Сборка приложения (`makefile`)
+Создадим простой `Makefile` для компиляции нашего сервера:
+```makefile
+CC=gcc
+CFLAGS=-Wall -Wextra -O2
+LDFLAGS=
+BIN=asynserver
+
+all: $(BIN)
+
+$(BIN): server.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+server.o: server.c
+	$(CC) $(CFLAGS) -c $<
+
+clean:
+	rm -f *.o $(BIN)
+
+.PHONY: all clean
+```
+
+### 3. Запуск сервиса через `SystemD`
+Подготовим файл конфигурации для запуска сервиса:
+```ini
+[Unit]
+Description=A simple asynchronous server using epoll
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/asynserver
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+Сохраним этот файл в каталоге `/etc/systemd/system/asynserver.service`.
+
+### 4. Установка сервисного скрипта (`service.sh`)
+Скрипт устанавливает службу и запускает её автоматически:
+```bash
+#!/bin/bash
+
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Please run this script with sudo."
+    exit 1
+fi
+
+echo "Copying binary to /usr/local/bin..."
+install -v -m 755 ./src/server /usr/local/bin/asynserver
+
+echo "Creating systemd service file..."
+install -v -m 644 ./src/asynserver.service /etc/systemd/system/asynserver.service
+
+echo "Reloading systemd daemon..."
+systemctl daemon-reload
+
+echo "Enabling the service on boot..."
+systemctl enable asynserver
+
+echo "Starting the service..."
+systemctl start asynserver
+
+echo "Checking service status:"
+systemctl status asynserver
+```
+
+### 5. Создание простого пакета DEB
+Используем простую структуру папок и утилиту `dpkg-deb` для упаковки программы в стандартный Debian-совместимый пакет:
+
+Структура директории для упаковки DEB-файла:
+```
+./DEBIAN/control      # Метаданные пакета
+./usr/local/bin       # Место размещения бинарника
+./etc/systemd/system  # Сервисный файл
+```
+
+Контрольный файл (`DEBIAN/control`) выглядит следующим образом:
+```ini
+Package: my-async-server
+Version: 1.0
+Architecture: amd64
+Maintainer: Your Name <your@email.com>
+Depends: libc6
+Section: net
+Priority: extra
+Description: A simple async server application in C++
+ This package provides a simple asynchronous network server implemented in C++.
+ It supports both TCP and UDP protocols, handling connections through epoll mechanism.
+ Homepage: https://example.com/my-async-server
+```
+
+Собираем пакет командой:
+```bash
+dpkg-deb --build build/debian
+```
+Полученный пакет называется `my-async-server_1.0_amd64.deb`.
+
+---
+
+## Заключение
+
+Таким образом, мы создали простое серверное приложение на C++, поддерживающее обработку асинхронных запросов через механизмы ядра Linux (`epoll`), включили поддержку базовых команд и обеспечили инфраструктуру для удобного развертывания в виде системных сервисов и сборочного пакета.
+
+Для тестирования выполните команду:
+```bash
+sudo ./service.sh install
+```
+
+Теперь ваш сервер доступен по адресу `localhost:8080` и готов обрабатывать запросы клиентов.
