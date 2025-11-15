@@ -11,12 +11,3 @@ README.md  # Документация по проекту
 build/
 |- debian     # Директория для подготовки .deb-пакета
 ```
-
-# Подготовка структуры директорий
-```shell
-mkdir src doc build && cd src
-touch server.c makefile service.sh
-cd ../build
-mkdir debian
-```
- 
